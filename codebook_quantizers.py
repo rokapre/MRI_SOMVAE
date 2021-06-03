@@ -94,9 +94,10 @@ class SOMQuantizer(nn.Module):
     alpha is the VQ commitment loss multiplier while beta is the SOM loss multiplier
 
     """
-    def __init__(self,num_embeddings = 256,embedding_dim = 32,som_h = 16,som_w = 16,alpha = 6,beta=1):
+    def __init__(self,num_embeddings = 256,embedding_dim = 32,som_h = 16,som_w = 16,alpha = 6,beta=1,geometry = "rectangular"):
         super(SOMQuantizer,self).__init__()
         assert som_h*som_w == num_embeddings
+        assert geometry in ["rectangular","toroid"]
         self._embedding_dim = embedding_dim
         self._num_embeddings = num_embeddings
         self._som_h = som_h
@@ -111,6 +112,7 @@ class SOMQuantizer(nn.Module):
                 self.idx_to_coord[idx] = (i,j)
                 idx+=1
         self.coord_to_idx = {v:k for k,v in self.idx_to_coord.items()} #converts grid coordinate to row index  of Embeddings
+        self.geometry = geometry 
     
     def get_neighbors(self,curr_idx):
         """
@@ -118,10 +120,16 @@ class SOMQuantizer(nn.Module):
 
         """
         curr_h,curr_w = self.idx_to_coord[curr_idx]
-        top_idx = self.coord_to_idx[(curr_h - 1,curr_w)] if curr_h - 1 >= 0 else ""
-        bottom_idx = self.coord_to_idx[(curr_h + 1,curr_w)] if curr_h + 1 < self._som_h else ""
-        left_idx = self.coord_to_idx[(curr_h,curr_w - 1)] if curr_w - 1 >= 0 else ""
-        right_idx = self.coord_to_idx[(curr_h,curr_w + 1)] if curr_w + 1 < self._som_w else ""
+        if self.geometry == "rectangular":
+            top_idx = self.coord_to_idx[(curr_h - 1,curr_w)] if curr_h - 1 >= 0 else ""
+            bottom_idx = self.coord_to_idx[(curr_h + 1,curr_w)] if curr_h + 1 < self._som_h else ""
+            left_idx = self.coord_to_idx[(curr_h,curr_w - 1)] if curr_w - 1 >= 0 else ""
+            right_idx = self.coord_to_idx[(curr_h,curr_w + 1)] if curr_w + 1 < self._som_w else ""
+        elif self.geometry == "toroid":
+            top_idx = self.coord_to_idx[(curr_h - 1,curr_w)] if curr_h - 1 >= 0 else self.coord_to_idx[(self._som_h - 1,curr_w)]
+            bottom_idx = self.coord_to_idx[(curr_h + 1,curr_w)] if curr_h + 1 < self._som_h else 0
+            left_idx = self.coord_to_idx[(curr_h,curr_w - 1)] if curr_w - 1 >= 0 else self.coord_to_idx[(curr_h,(self._som_w - 1))]
+            right_idx = self.coord_to_idx[(curr_h,curr_w + 1)] if curr_w + 1 < self._som_w else 0
         neighbors = [curr_idx,top_idx,bottom_idx,left_idx,right_idx]
         neighbors = list(filter(lambda x: x!= "", neighbors))
         return(neighbors)
@@ -163,4 +171,102 @@ class SOMQuantizer(nn.Module):
         #avg_probs = torch.mean(encodings, dim = 0)
         #perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         return(loss, quantized.permute(0, 4, 1, 2, 3).contiguous(), encodings)
-       
+
+
+class PSOMQuantizer(nn.Module):
+    """
+    The PSOMQuantizer is a probabilistic modification to the SOMQuantizer. The SOM assigns
+    each incoming voxel to just 1 node and updates the neighbors. The PSOM instead assigns a probability
+    distribution over the nodes, so each voxel "belongs" to multiple nodes. A combination of a 
+    cluster assignment hardening (CAH) loss and a probabilistic SOM loss is used. sij below represents the 
+    probability of voxel i belonging to cluster j. 
+
+    Details for the PSOM can be found in the following paper: https://dl.acm.org/doi/pdf/10.1145/3450439.3451872
+    """
+    def __init__(self,num_embeddings = 256,embedding_dim = 32,som_h = 16,som_w = 16,gamma = 1,beta = 2,geometry = "rectangular", df = 10,Kappa=2):
+        super(PSOMQuantizer,self).__init__()
+        assert som_h*som_w == num_embeddings
+        assert geometry in ["rectangular","toroid"]
+        self._embedding_dim = embedding_dim
+        self._num_embeddings = num_embeddings
+        self._som_h = som_h
+        self._som_w = som_w 
+        self.gamma = gamma 
+        self.beta = beta 
+        self._embedding = nn.Embedding(num_embeddings,embedding_dim)
+        self._embedding.weight.data.normal_()
+        self.idx_to_coord = {} #needed to convert row index on Embeddings to grid coordinate
+        idx = 0 
+        for i in range(som_h):
+            for j in range(som_w):
+                self.idx_to_coord[idx] = (i,j)
+                idx+=1
+        self.coord_to_idx = {v:k for k,v in self.idx_to_coord.items()} #converts grid coordinate to row index  of Embeddings
+        self.geometry = geometry
+        self.df = df
+        self.Kappa = Kappa 
+        use_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda:0" if use_cuda else "cpu")
+        self.adjacency = torch.zeros((num_embeddings,num_embeddings),device=self.device)
+        for i in range(num_embeddings):
+            self.adjacency[i,self.get_neighbors(i)] = 1
+
+    def get_neighbors(self,curr_idx):
+        """
+        This method gets the neighbors 1 of the current node in the SOM grid 
+
+        """
+        curr_h,curr_w = self.idx_to_coord[curr_idx]
+        if self.geometry == "rectangular":
+            top_idx = self.coord_to_idx[(curr_h - 1,curr_w)] if curr_h - 1 >= 0 else ""
+            bottom_idx = self.coord_to_idx[(curr_h + 1,curr_w)] if curr_h + 1 < self._som_h else ""
+            left_idx = self.coord_to_idx[(curr_h,curr_w - 1)] if curr_w - 1 >= 0 else ""
+            right_idx = self.coord_to_idx[(curr_h,curr_w + 1)] if curr_w + 1 < self._som_w else ""
+        elif self.geometry == "toroid":
+            top_idx = self.coord_to_idx[(curr_h - 1,curr_w)] if curr_h - 1 >= 0 else self.coord_to_idx[(self._som_h - 1,curr_w)]
+            bottom_idx = self.coord_to_idx[(curr_h + 1,curr_w)] if curr_h + 1 < self._som_h else 0
+            left_idx = self.coord_to_idx[(curr_h,curr_w - 1)] if curr_w - 1 >= 0 else self.coord_to_idx[(curr_h,(self._som_w - 1))]
+            right_idx = self.coord_to_idx[(curr_h,curr_w + 1)] if curr_w + 1 < self._som_w else 0
+        neighbors = [top_idx,bottom_idx,left_idx,right_idx]
+        neighbors = list(filter(lambda x: x!= "", neighbors))
+        return(neighbors)
+
+        
+    def forward(self,inputs):
+
+        inputs = inputs.permute(0, 2, 3, 4, 1).contiguous()
+        input_shape = inputs.shape
+
+        # Flatten input
+        flat_inputs = inputs.view(-1, self._embedding_dim)
+        
+        dist = (torch.sum(flat_inputs.detach()**2, dim=1,keepdims=True) + 
+                torch.sum(self._embedding.weight**2, dim=1)) - 2*torch.matmul(flat_inputs.detach(),self._embedding.weight.t())
+        
+        sij_numer = (1 + dist/self.df).pow(-0.5*(self.df+1))
+        sij_denom = sij_numer.sum(dim=1,keepdims=True)
+
+        sij = torch.divide(sij_numer,sij_denom)
+
+        sij_Kappa = sij.pow(self.Kappa)
+
+        sumi_sij = sij.sum(dim=0,keepdims=True)
+
+        tij_numer = torch.divide(sij_Kappa,sumi_sij)
+        tij_denom = tij_numer.sum(dim=1,keepdims=True)
+
+        tij = torch.divide(tij_numer,tij_denom)
+
+        log_sij = torch.log(sij)
+        log_tij = torch.log(tij)
+
+        CAH_loss = torch.sum(torch.multiply(tij,log_tij-log_sij))
+
+        log_sie = torch.matmul(log_sij,self.adjacency)
+
+        sumj_sij_log_sie = torch.sum(torch.multiply(sij,log_sie), dim = 1)
+
+        SOM_loss = -sumj_sij_log_sie.mean()
+        total_loss = self.gamma*CAH_loss + self.beta*SOM_loss
+
+        return({"CAH_loss": CAH_loss,"SOM_loss": SOM_loss,"vq_loss": total_loss})

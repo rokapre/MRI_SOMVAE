@@ -53,6 +53,8 @@ def train(model, optimizer, loss_function, training_generator, epoch, log_every_
             loss = recon_loss + outputs['vq_loss']
         else:
             loss = recon_loss
+        if "KLD_loss" in outputs:
+            loss = loss + outputs["KLD_loss"]
 
         # Back propagate
         loss.backward()
@@ -115,6 +117,8 @@ def test(model, loss_function, validation_generator):
                 loss = recon_loss + outputs['vq_loss']
             else:
                 loss = recon_loss
+            if "KLD_loss" in outputs:
+                loss = loss + outputs["KLD_loss"]
             test_loss += loss.item()
     
     t_epoch = time.time() - t0
@@ -183,6 +187,8 @@ def train_NewVQVAE(model, optimizer, loss_function, training_generator, epoch, l
             loss = recon_loss + outputs['vq_loss']
         else:
             loss = recon_loss
+        if "KLD_loss" in outputs:
+            loss = loss + outputs["KLD_loss"]
 
         # Back propagate
         loss.backward()
@@ -248,6 +254,91 @@ def test_NewVQVAE(model, loss_function, validation_generator):
                 loss = recon_loss + outputs['vq_loss']
             else:
                 loss = recon_loss
+            if "KLD_loss" in outputs:
+                loss = loss+ outputs["KLD_loss"]
+
+            test_loss += loss.item()
+    
+    t_epoch = time.time() - t0
+    test_loss /= len(validation_generator) * batch_size
+    print('====> Test set loss: {:.4f}\tTime elapsed: {:s}'.format(
+        test_loss, str(datetime.timedelta(seconds=int(t_epoch)))))
+    print()
+    return test_loss
+
+
+def train_vae(model,optimizer,loss_function,training_generator,epoch):
+    print('====> Begin epoch {}'.format(epoch+1))
+    print()
+    # Setup GPU if available
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda:0" if use_cuda else "cpu")
+    torch.backends.cudnn.benchmark = True
+    if use_cuda:
+        if torch.cuda.device_count() > 1:
+          print("Let's use", torch.cuda.device_count(), "GPUs!")
+          # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
+          model = nn.DataParallel(model)
+    model.to(device)
+
+    t0 = time.time()
+    model.train()
+    train_loss = 0
+    batch_id = 1
+    batch_size = training_generator.batch_size
+    for batch_in, batch_out in training_generator:
+        batch_run_time = time.time()
+        # Transfer to GPU
+        batch_in, batch_out = batch_in.to(device), batch_out.to(device)
+        
+        # Clear optimizer gradients
+        optimizer.zero_grad()
+        # Forward pass through the model
+        outputs = model(batch_in)
+        
+        # Calculate loss
+        recon_loss = loss_function(outputs['x_out'], batch_out)
+        KLD_loss = outputs["KLD_loss"]
+        loss = recon_loss + KLD_loss
+        # Back propagate
+        loss.backward()
+        train_loss += loss.item()
+        optimizer.step()
+
+    t_epoch = time.time() - t0
+    train_loss /= len(training_generator) * batch_size
+    print()
+    print('====> Epoch: {} Average loss: {:.4f}\tTime elapsed: {:s}'.format(
+          epoch+1, train_loss, str(datetime.timedelta(seconds=int(t_epoch)))))
+    return train_loss
+
+def test_vae(model, loss_function, validation_generator):
+    # Setup GPU if available
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda:0" if use_cuda else "cpu")
+    torch.backends.cudnn.benchmark = True
+    if use_cuda:
+        if torch.cuda.device_count() > 1:
+          print("Let's use", torch.cuda.device_count(), "GPUs!")
+          # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
+          model = nn.DataParallel(model)
+    model.to(device)
+
+    model.eval()
+    test_loss = 0
+    t0 = time.time()
+    batch_size = validation_generator.batch_size
+    with torch.no_grad():
+        for batch_in, batch_out in validation_generator:
+            # Transfer to GPU
+            batch_in, batch_out = batch_in.to(device), batch_out.to(device)
+            # Forward pass through the model
+            outputs = model(batch_in)
+            
+            # Calculate loss
+            recon_loss = loss_function(outputs['x_out'], batch_out)
+            KLD_loss = outputs["KLD_loss"]
+            loss = recon_loss + KLD_loss 
             test_loss += loss.item()
     
     t_epoch = time.time() - t0

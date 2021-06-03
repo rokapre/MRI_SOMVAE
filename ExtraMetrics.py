@@ -1,3 +1,4 @@
+import numpy as np
 import torch.nn.functional as F 
 import torch 
 
@@ -58,10 +59,6 @@ def SSIM(Xorig,Xrecon,length=9,width=None,height=None):
     ssim = (numerator/denominator).mean(dim=(1,2,3,4))
     return(ssim)
 
-#SSIM(image_practice,randimg)
-
-#randimg = torch.rand(image_practice.shape)
-
 def PSNR(Xorig,Xrecon):
     """
     Calculates Peak Signal to Noise Ratio (PSNR) in dB between an image and its reconstruction
@@ -73,6 +70,35 @@ def PSNR(Xorig,Xrecon):
 
     return(psnr)
 
+def MoranScore(SOMmodel):
+    codebook = SOMmodel.quantization._embedding.weight.detach().numpy()
+    som_h = SOMmodel.quantization._som_h
+    som_w = SOMmodel.quantization._som_w
+    idx_to_coord = SOMmodel.quantization.idx_to_coord
 
+    N = codebook.shape[0]
+    #codebook = SS.fit_transform(codebook)
+    #codebook = codebook.sum(axis=1,keepdims=True)
+    codebook = codebook[:,10].reshape(N,1)
+    codebook_mean = codebook.mean(axis=0,keepdims=True)
 
+    centered_codebook = codebook - codebook_mean
+
+    XXT = np.matmul(centered_codebook,centered_codebook.T)
+
+    W_ij = np.zeros(XXT.shape) #weight matrix
+
+    for i in range(codebook.shape[0]):
+        for j in range(codebook.shape[0]):
+            hi,wi = idx_to_coord[i] #hi and wj here are coordinates of SOM grid
+            hj,wj = idx_to_coord[j]
+            som_dist = np.abs(hj-hi) + np.abs(wj-wi)
+            W_ij[i,j] = np.exp(-som_dist)
+
+    XXT_diag = np.diag(XXT)
+    W = np.sum(W_ij)
+
+    I_Moran = N/W * (np.sum(W_ij * XXT))/(np.sum(XXT_diag))
+
+    return(I_Moran)
 
